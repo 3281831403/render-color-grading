@@ -36,6 +36,11 @@ __all__ = [
     "grade_batch",
 ]
 
+# Rec. 709 luma coefficients.
+_LUMA_R = 0.2126
+_LUMA_G = 0.7152
+_LUMA_B = 0.0722
+
 
 class GradeError(Exception):
     """Raised when an argument violates the documented grading contract."""
@@ -48,6 +53,33 @@ def _clamp(value: float) -> float:
     if value > 1.0:
         return 1.0
     return value
+
+
+def _is_real(value):
+    """Return True for finite ints/floats (booleans excluded)."""
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def _check_cubic(lut):
+    """Validate *lut* as a cube with at least two samples per axis.
+
+    Returns the axis length.  Raises :class:`GradeError` for any structural
+    problem (non-list axes, ragged dimensions, axis length below 2).
+    """
+    if not isinstance(lut, list) or len(lut) < 2:
+        raise GradeError("LUT must be a cube with at least 2 samples per axis")
+    size = len(lut)
+    for row in lut:
+        if not isinstance(row, list) or len(row) != size:
+            raise GradeError("LUT is not cubic: every axis must have the same length")
+        for column in row:
+            if not isinstance(column, list) or len(column) != size:
+                raise GradeError("LUT is not cubic: every axis must have the same length")
+    return size
 
 
 def build_lut(size, fn):
@@ -72,7 +104,23 @@ def build_lut(size, fn):
         ``len(lut[r][g]) == size`` and ``lut[r][g][b]`` the sample for
         ``(r / (size - 1), g / (size - 1), b / (size - 1))``.
     """
-    raise NotImplementedError("build_lut is not implemented yet")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 2:
+        raise GradeError("LUT size must be an int >= 2")
+
+    last = size - 1
+    lut = []
+    for ri in range(size):
+        r = ri / last
+        plane = []
+        for gi in range(size):
+            g = gi / last
+            row = []
+            for bi in range(size):
+                b = bi / last
+                row.append(tuple(float(channel) for channel in fn(r, g, b)))
+            plane.append(row)
+        lut.append(plane)
+    return lut
 
 
 def sample_lut(lut, r, g, b):
@@ -92,7 +140,46 @@ def sample_lut(lut, r, g, b):
     tuple
         ``(r, g, b)`` floats clamped into ``[0.0, 1.0]``.
     """
-    raise NotImplementedError("sample_lut is not implemented yet")
+    size = _check_cubic(lut)
+    last = size - 1
+
+    # Clamp coordinates first so out-of-range values never become negative or
+    # oversized indices into the cube.
+    coords = (_clamp(r), _clamp(g), _clamp(b))
+    lowers = []
+    uppers = []
+    fracs = []
+    for coord in coords:
+        scaled = coord * last
+        index_lo = int(math.floor(scaled))
+        if index_lo > last - 1:
+            index_lo = last - 1
+        index_hi = index_lo + 1
+        frac = scaled - index_lo
+        lowers.append(index_lo)
+        uppers.append(index_hi)
+        fracs.append(frac)
+
+    r0, g0, b0 = lowers
+    r1, g1, b1 = uppers
+    fr, fg, fb = fracs
+
+    out = [0.0, 0.0, 0.0]
+    for dr in (0, 1):
+        wr = fr if dr == 1 else 1.0 - fr
+        ri = r1 if dr == 1 else r0
+        for dg in (0, 1):
+            wg = fg if dg == 1 else 1.0 - fg
+            gi = g1 if dg == 1 else g0
+            for db in (0, 1):
+                wb = fb if db == 1 else 1.0 - fb
+                bi = b1 if db == 1 else b0
+                weight = wr * wg * wb
+                corner = lut[ri][gi][bi]
+                for channel in range(3):
+                    out[channel] += weight * corner[channel]
+
+    return tuple(_clamp(channel) for channel in out)
 
 
 def apply_lut(img, lut):
@@ -110,7 +197,12 @@ def apply_lut(img, lut):
     list
         ``list[list[tuple[float, float, float]]]`` of the same shape as *img*.
     """
-    raise NotImplementedError("apply_lut is not implemented yet")
+    # Reject a non-cubic / single-sample LUT before touching the image.
+    _check_cubic(lut)
+    return [
+        [sample_lut(lut, r, g, b) for (r, g, b) in row]
+        for row in img
+    ]
 
 
 def curve_map(x, curve):
@@ -134,7 +226,15 @@ def curve_map(x, curve):
     float
         The mapped channel value in ``[0.0, 1.0]``.
     """
-    raise NotImplementedError("curve_map is not implemented yet")
+    lift = curve.get("lift", 0.0)
+    gamma = curve.get("gamma", 1.0)
+    gain = curve.get("gain", 1.0)
+
+    if not _is_real(gamma) or gamma <= 0.0:
+        raise GradeError("gamma must be a positive number")
+
+    base = _clamp(_clamp(x) * gain + lift)
+    return _clamp(base ** (1.0 / gamma))
 
 
 def saturation(img, amount):
@@ -157,7 +257,22 @@ def saturation(img, amount):
     list
         A new image with the same shape as *img*.
     """
-    raise NotImplementedError("saturation is not implemented yet")
+    if amount < 0.0:
+        amount = 0.0
+
+    result = []
+    for row in img:
+        out_row = []
+        for (r, g, b) in row:
+            lum = _LUMA_R * r + _LUMA_G * g + _LUMA_B * b
+            out_row.append(
+                tuple(
+                    _clamp(lum + amount * (channel - lum))
+                    for channel in (r, g, b)
+                )
+            )
+        result.append(out_row)
+    return result
 
 
 def contrast(img, pivot, amount):
@@ -179,7 +294,20 @@ def contrast(img, pivot, amount):
     list
         A new image with the same shape as *img*.
     """
-    raise NotImplementedError("contrast is not implemented yet")
+    pivot = _clamp(pivot)
+
+    result = []
+    for row in img:
+        out_row = []
+        for pixel in row:
+            out_row.append(
+                tuple(
+                    _clamp(pivot + (channel - pivot) * amount)
+                    for channel in pixel
+                )
+            )
+        result.append(out_row)
+    return result
 
 
 def validate_lut(lut, size):
@@ -202,7 +330,94 @@ def validate_lut(lut, size):
     list[str]
         One string per detected problem, in the order described above.
     """
-    raise NotImplementedError("validate_lut is not implemented yet")
+    problems = []
+
+    if not isinstance(size, int) or isinstance(size, bool) or size < 2:
+        problems.append(
+            f"invalid LUT size {size!r}: expected an int with size >= 2"
+        )
+        return problems
+
+    if not isinstance(lut, list) or len(lut) != size:
+        actual = len(lut) if isinstance(lut, list) else type(lut).__name__
+        problems.append(
+            f"size mismatch: LUT has {actual} planes, expected {size}"
+        )
+        return problems
+
+    cubic = True
+    for ri, plane in enumerate(lut):
+        if not isinstance(plane, list) or len(plane) != size:
+            problems.append(
+                f"LUT is not cubic: plane {ri} has length "
+                f"{len(plane) if isinstance(plane, list) else type(plane).__name__}, "
+                f"expected {size}"
+            )
+            cubic = False
+            continue
+        for gi, column in enumerate(plane):
+            if not isinstance(column, list) or len(column) != size:
+                problems.append(
+                    f"LUT is not cubic: column lut[{ri}][{gi}] has length "
+                    f"{len(column) if isinstance(column, list) else type(column).__name__}, "
+                    f"expected {size}"
+                )
+                cubic = False
+
+    if not cubic:
+        # Entry-level checks would index into malformed structures.
+        return problems
+
+    for ri in range(size):
+        for gi in range(size):
+            for bi in range(size):
+                entry = lut[ri][gi][bi]
+                if (
+                    not isinstance(entry, (tuple, list))
+                    or len(entry) != 3
+                    or not all(_is_real(channel) for channel in entry)
+                ):
+                    problems.append(
+                        f"invalid entry at lut[{ri}][{gi}][{bi}]: "
+                        f"expected a length-3 sequence of finite numbers, got {entry!r}"
+                    )
+                    continue
+                for channel_index, channel in enumerate(entry):
+                    if channel < 0.0 or channel > 1.0:
+                        problems.append(
+                            f"value range violation at lut[{ri}][{gi}][{bi}] "
+                            f"channel {channel_index}: {channel} is outside [0.0, 1.0]"
+                        )
+
+    return problems
+
+
+def _validate_image(img):
+    """Raise :class:`GradeError` if *img* violates the image contract."""
+    if not isinstance(img, list):
+        raise GradeError("image must be a list of rows")
+
+    row_length = None
+    for ri, row in enumerate(img):
+        if not isinstance(row, list):
+            raise GradeError(f"image row {ri} must be a list of pixels")
+        if row_length is None:
+            row_length = len(row)
+        elif len(row) != row_length:
+            raise GradeError(
+                f"image row {ri} has length {len(row)}, expected {row_length}"
+            )
+        for pi, pixel in enumerate(row):
+            if not isinstance(pixel, (tuple, list)) or len(pixel) != 3:
+                raise GradeError(
+                    f"pixel [{ri}][{pi}] must be a length-3 (r, g, b) sequence"
+                )
+            for channel in pixel:
+                if not _is_real(channel) or channel < 0.0 or channel > 1.0:
+                    raise GradeError(
+                        f"pixel [{ri}][{pi}] has a channel outside finite [0.0, 1.0]: "
+                        f"{channel!r}"
+                    )
 
 
 def grade_batch(images, lut, config):
@@ -230,4 +445,43 @@ def grade_batch(images, lut, config):
         order and both ``images`` and ``count`` are empty/``0`` for an empty
         batch.
     """
-    raise NotImplementedError("grade_batch is not implemented yet")
+    # Validate everything up front: no output exists until the whole batch is
+    # known to be legal, so a failure rolls back cleanly.
+    for img in images:
+        _validate_image(img)
+    _check_cubic(lut)
+
+    curve = config.get("curve")
+    sat_amount = config.get("saturation")
+    contrast_amount = config.get("contrast")
+    pivot = config.get("pivot")
+
+    graded = []
+    for img in images:
+        # Freshly allocated buffers per image: nothing is shared across the
+        # batch, and the caller's input is never mutated.
+        out = apply_lut(img, lut)
+
+        if curve is not None:
+            out = [
+                [
+                    tuple(curve_map(channel, curve) for channel in pixel)
+                    for pixel in row
+                ]
+                for row in out
+            ]
+
+        if sat_amount is not None:
+            out = saturation(out, sat_amount)
+
+        if contrast_amount is not None:
+            pivot_value = 0.5 if pivot is None else pivot
+            out = contrast(out, pivot_value, contrast_amount)
+
+        graded.append(out)
+
+    return {
+        "images": graded,
+        "count": len(graded),
+        "lut_size": len(lut),
+    }
